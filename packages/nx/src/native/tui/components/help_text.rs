@@ -3,23 +3,30 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
 };
 
+use crate::native::tui::components::nx_paragraph::NxParagraph;
 use crate::native::tui::theme::THEME;
 
 pub struct HelpText {
     collapsed_mode: bool,
     is_dimmed: bool,
     align_left: bool,
+    show_perf_report: bool,
 }
 
 impl HelpText {
-    pub fn new(collapsed_mode: bool, is_dimmed: bool, align_left: bool) -> Self {
+    pub fn new(
+        collapsed_mode: bool,
+        is_dimmed: bool,
+        align_left: bool,
+        show_perf_report: bool,
+    ) -> Self {
         Self {
             collapsed_mode,
             is_dimmed,
             align_left,
+            show_perf_report,
         }
     }
 
@@ -63,7 +70,7 @@ impl HelpText {
                 Span::styled("?", key_style),
             ];
             f.render_widget(
-                Paragraph::new(Line::from(hint)).alignment(if self.align_left {
+                NxParagraph::new(Line::from(hint)).alignment(if self.align_left {
                     Alignment::Left
                 } else {
                     Alignment::Right
@@ -72,7 +79,7 @@ impl HelpText {
             );
         } else {
             // Show full shortcuts
-            let shortcuts = vec![
+            let mut shortcuts = vec![
                 Span::styled("quit: ", label_style),
                 Span::styled("q", key_style),
                 Span::styled("  ", label_style),
@@ -95,8 +102,15 @@ impl HelpText {
                 Span::styled("<enter>", key_style),
             ];
 
+            // Only advertise the performance report once it exists (run finished).
+            if self.show_perf_report {
+                shortcuts.push(Span::styled("  ", label_style));
+                shortcuts.push(Span::styled("perf report: ", label_style));
+                shortcuts.push(Span::styled("p", key_style));
+            }
+
             f.render_widget(
-                Paragraph::new(Line::from(shortcuts)).alignment(Alignment::Right),
+                NxParagraph::new(Line::from(shortcuts)).alignment(Alignment::Right),
                 safe_area,
             );
         }
