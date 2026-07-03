@@ -333,13 +333,38 @@ async function createReadme(
   });
 }
 
+// pnpm 11+ fails installs when a dependency's build scripts are neither
+// allowed nor denied (ERR_PNPM_IGNORED_BUILDS). Pre-approve the build-script
+// packages the Nx stack pulls in: allow the ones whose scripts are required
+// to function, deny the ones that ship prebuilt binaries so their scripts
+// are skipped, as they were under pnpm 10.
+const pnpmAllowBuilds: Record<string, boolean> = {
+  nx: true,
+  cypress: true,
+  detox: true,
+  '@nestjs/core': false,
+  '@parcel/watcher': false,
+  '@swc/core': false,
+  '@tailwindcss/oxide': false,
+  'core-js': false,
+  'core-js-pure': false,
+  esbuild: false,
+  sharp: false,
+  'unrs-resolver': false,
+};
+
 function addPnpmSettings(
   tree: Tree,
   options: NormalizedSchema,
   packageManagerVersion: string
 ) {
   const buildAllowlist = gte(packageManagerVersion, '11.0.0')
-    ? `allowBuilds:\n  nx: true`
+    ? `allowBuilds:\n${Object.entries(pnpmAllowBuilds)
+        .map(
+          ([pkg, allowed]) =>
+            `  ${pkg.startsWith('@') ? `'${pkg}'` : pkg}: ${allowed}`
+        )
+        .join('\n')}`
     : `onlyBuiltDependencies:\n  - nx`;
 
   tree.write(

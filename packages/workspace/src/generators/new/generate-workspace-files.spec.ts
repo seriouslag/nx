@@ -422,6 +422,17 @@ describe('@nx/workspace:generateWorkspaceFiles', () => {
       autoInstallPeers: true
       allowBuilds:
         nx: true
+        cypress: true
+        detox: true
+        '@nestjs/core': false
+        '@parcel/watcher': false
+        '@swc/core': false
+        '@tailwindcss/oxide': false
+        core-js: false
+        core-js-pure: false
+        esbuild: false
+        sharp: false
+        unrs-resolver: false
       "
     `);
     expect(tree.exists('proj/.npmrc')).toBeFalsy();
