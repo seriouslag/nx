@@ -767,9 +767,9 @@ function findOriginalKeys(
   } = node;
   const candidates: Iterable<[string, PackageSnapshot]> =
     lockfileVersion >= 6
-      ? packageIndex.get(
+      ? (packageIndex.get(
           version.startsWith('npm:') ? aliasTargetName(version) : packageName
-        ) ?? NO_CANDIDATES
+        ) ?? NO_CANDIDATES)
       : Object.entries(packages);
   const matchedKeys = [];
   for (const [key, snapshot] of candidates) {

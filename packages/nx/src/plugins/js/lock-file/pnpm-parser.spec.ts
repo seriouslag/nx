@@ -1159,7 +1159,12 @@ importers:
 
       let result = '';
       expect(() => {
-        result = stringifyPnpmLockfile(graph, lockFile, packageJson, '/virtual');
+        result = stringifyPnpmLockfile(
+          graph,
+          lockFile,
+          packageJson,
+          '/virtual'
+        );
       }).not.toThrow();
       expect(result).toContain('workspace_modules/@myorg/b');
     });
