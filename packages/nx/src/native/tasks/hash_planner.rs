@@ -1,14 +1,16 @@
 use crate::native::logger::enable_logger;
 use crate::native::tasks::{
     dep_outputs::get_dep_output,
-    types::{CwdMode, HashInstruction, TaskGraph},
+    types::{CwdMode, HashInstruction, HashPlans, InstructionPool, TaskGraph},
 };
 use crate::native::types::{Input, NxJson};
 use crate::native::{
     project_graph::types::ProjectGraph,
     tasks::{inputs::SplitInputs, types::Task},
 };
+use dashmap::DashMap;
 use napi::bindgen_prelude::External;
+use once_cell::sync::OnceCell;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use tracing::trace;
@@ -26,6 +28,24 @@ pub struct HashPlanner {
     project_graph: Arc<ProjectGraph>,
     /// Each external node mapped to its transitive project-node deps, memoized per instance.
     external_deps_mapped: OnceLock<HashMap<String, Vec<String>>>,
+    /// Memoized instruction ids contributed by (dependency project, propagated
+    /// input), including its whole transitive closure. Shared across all tasks
+    /// in all get_plans calls: values derive only from the immutable project
+    /// graph and nx_json. Only consulted on acyclic graphs — see
+    /// `dependency_memo_enabled`.
+    subtree_memo: DashMap<String, Arc<OnceCell<Arc<SubtreeResult>>>>,
+    is_acyclic: OnceLock<bool>,
+    /// Interner backing every plan this planner produces.
+    instruction_pool: Arc<InstructionPool>,
+}
+
+/// Instruction ids contributed by one (project, propagated input) dependency subtree.
+struct SubtreeResult {
+    ids: Vec<u32>,
+    /// True when the subtree cannot be spliced from the memo: it contains
+    /// deps-outputs inputs (whose resolution depends on the root task) or an
+    /// unexpected propagation shape. Callers must use the per-task traversal.
+    needs_legacy: bool,
 }
 
 /// Cycle-detection set with an undo log. Each dependency input needs its own
@@ -82,6 +102,9 @@ impl HashPlanner {
             nx_json,
             project_graph: Arc::clone(project_graph),
             external_deps_mapped: OnceLock::new(),
+            subtree_memo: DashMap::new(),
+            is_acyclic: OnceLock::new(),
+            instruction_pool: Arc::new(InstructionPool::new()),
         }
     }
 
@@ -89,7 +112,7 @@ impl HashPlanner {
         &self,
         task_ids: Vec<&str>,
         task_graph: TaskGraph,
-    ) -> anyhow::Result<HashMap<String, Vec<HashInstruction>>> {
+    ) -> anyhow::Result<HashPlans> {
         let function_start = std::time::Instant::now();
 
         trace!("Starting get_plans_internal for {} tasks", task_ids.len());
@@ -101,8 +124,9 @@ impl HashPlanner {
 
         trace!("External deps setup completed in {:?}", setup_duration);
 
+        let pool = &self.instruction_pool;
         let parallel_start = std::time::Instant::now();
-        let result: anyhow::Result<HashMap<String, Vec<HashInstruction>>> = task_ids
+        let result: anyhow::Result<HashMap<String, Vec<u32>>> = task_ids
             .par_iter()
             .map(|id| {
                 let task = &task_graph
@@ -118,16 +142,10 @@ impl HashPlanner {
                     external_deps_mapped,
                 )?;
 
-                let self_inputs = self.self_and_deps_inputs(
-                    &task.target.project,
-                    task,
-                    &inputs,
-                    &task_graph,
-                    external_deps_mapped,
-                    &mut VisitedTracker::new(task.target.project.as_str()),
-                )?;
-
-                let mut inputs: Vec<HashInstruction> = target
+                // Top-level (per-task) instructions are built as values and
+                // interned; the O(tasks x closure) dependency portion is
+                // spliced from the memo as ids without materialization.
+                let mut ids: Vec<u32> = target
                     .unwrap_or(vec![])
                     .into_iter()
                     .chain(vec![
@@ -138,13 +156,29 @@ impl HashPlanner {
                             "{workspaceRoot}/.nxignore".to_string(),
                         ]),
                     ])
-                    .chain(self_inputs)
+                    .chain(self.gather_self_inputs(&task.target.project, &inputs.self_inputs))
+                    .chain(self.gather_dependency_outputs(
+                        task,
+                        &task_graph,
+                        &inputs.deps_outputs,
+                    )?)
+                    .chain(self.gather_project_inputs(&inputs.project_inputs)?)
+                    .map(|instruction| pool.intern(instruction))
                     .collect();
 
-                inputs.par_sort();
-                inputs.dedup();
+                ids.extend(self.gather_dependency_ids(
+                    task,
+                    &inputs.deps_inputs,
+                    &task_graph,
+                    &self.project_graph.dependencies[&task.target.project],
+                    external_deps_mapped,
+                    &mut VisitedTracker::new(task.target.project.as_str()),
+                )?);
 
-                Ok((id.to_string(), inputs))
+                ids.sort_unstable();
+                ids.dedup();
+
+                Ok((id.to_string(), ids))
             })
             .collect();
 
@@ -153,11 +187,12 @@ impl HashPlanner {
 
         if result.is_ok() {
             tracing::debug!(
-                "get_plans_internal COMPLETED in {:?} - processed {} tasks (setup: {:?}, parallel_planning: {:?})",
+                "get_plans_internal COMPLETED in {:?} - processed {} tasks (setup: {:?}, parallel_planning: {:?}, pool: {} unique instructions)",
                 total_duration,
                 task_ids.len(),
                 setup_duration,
-                parallel_duration
+                parallel_duration,
+                self.instruction_pool.len()
             );
         } else {
             tracing::debug!(
@@ -167,7 +202,32 @@ impl HashPlanner {
             );
         }
 
-        result
+        result.map(|plans| HashPlans {
+            pool: Arc::clone(&self.instruction_pool),
+            plans,
+        })
+    }
+
+    /// Materialized, Ord-sorted plans for the string-returning JS API; the
+    /// hashing path uses `get_plans_reference` and never materializes.
+    pub fn get_plans_materialized(
+        &self,
+        task_ids: Vec<&str>,
+        task_graph: TaskGraph,
+    ) -> anyhow::Result<HashMap<String, Vec<HashInstruction>>> {
+        let hash_plans = self.get_plans_internal(task_ids, task_graph)?;
+        Ok(hash_plans
+            .plans
+            .into_iter()
+            .map(|(task_id, ids)| {
+                let mut instructions: Vec<HashInstruction> = ids
+                    .into_iter()
+                    .map(|id| hash_plans.pool.get(id).value().clone())
+                    .collect();
+                instructions.par_sort();
+                (task_id, instructions)
+            })
+            .collect())
     }
 
     #[napi(ts_return_type = "Record<string, string[]>")]
@@ -177,15 +237,15 @@ impl HashPlanner {
         task_graph: TaskGraph,
     ) -> anyhow::Result<HashMap<String, Vec<HashInstruction>>> {
         let task_ids: Vec<&str> = task_ids.iter().map(|s| s.as_str()).collect();
-        self.get_plans_internal(task_ids, task_graph)
+        self.get_plans_materialized(task_ids, task_graph)
     }
 
-    #[napi]
+    #[napi(ts_return_type = "ExternalObject<Record<string, Array<HashInstruction>>>")]
     pub fn get_plans_reference(
         &self,
         task_ids: Vec<String>,
         task_graph: TaskGraph,
-    ) -> anyhow::Result<External<HashMap<String, Vec<HashInstruction>>>> {
+    ) -> anyhow::Result<External<HashPlans>> {
         let task_ids: Vec<&str> = task_ids.iter().map(|s| s.as_str()).collect();
         let plans = self.get_plans_internal(task_ids, task_graph)?;
         Ok(External::new(plans))
@@ -349,6 +409,195 @@ impl HashPlanner {
                 )
             })
             .collect()
+    }
+
+    /// The subtree memo composes child results without per-path cycle checks,
+    /// so it is only sound on acyclic graphs (also avoids OnceCell deadlock on
+    /// a dependency cycle). Cyclic graphs use the visited-scoped traversal.
+    fn dependency_memo_enabled(&self) -> bool {
+        *self
+            .is_acyclic
+            .get_or_init(|| self.project_graph_is_acyclic())
+    }
+
+    fn project_graph_is_acyclic(&self) -> bool {
+        const WHITE: u8 = 0;
+        const GRAY: u8 = 1;
+        const BLACK: u8 = 2;
+        let deps = &self.project_graph.dependencies;
+        let mut color: hashbrown::HashMap<&str, u8> = hashbrown::HashMap::new();
+
+        for start in deps.keys() {
+            if color.get(start.as_str()).copied().unwrap_or(WHITE) != WHITE {
+                continue;
+            }
+            let mut stack: Vec<(&str, usize)> = vec![(start.as_str(), 0)];
+            color.insert(start.as_str(), GRAY);
+            while let Some((node, edge_idx)) = stack.last_mut() {
+                let children = deps.get(*node).map(|c| c.as_slice()).unwrap_or(&[]);
+                if let Some(child) = children.get(*edge_idx) {
+                    *edge_idx += 1;
+                    if !self.project_graph.nodes.contains_key(child) {
+                        continue;
+                    }
+                    match color.get(child.as_str()).copied().unwrap_or(WHITE) {
+                        GRAY => return false,
+                        WHITE => {
+                            color.insert(child.as_str(), GRAY);
+                            stack.push((child.as_str(), 0));
+                        }
+                        _ => {}
+                    }
+                } else {
+                    color.insert(node, BLACK);
+                    stack.pop();
+                }
+            }
+        }
+        true
+    }
+
+    fn memoized_dep_subtree(
+        &self,
+        dep: &str,
+        input: &Input,
+        external_deps_mapped: &HashMap<String, Vec<String>>,
+    ) -> anyhow::Result<Arc<SubtreeResult>> {
+        let cache_key = match input {
+            Input::Inputs { input, .. } => format!("{dep}\0i\0{input}"),
+            Input::FileSet { fileset, .. } => format!("{dep}\0f\0{fileset}"),
+            // Other input kinds never reach dependencies (get_inputs_for_dependency
+            // returns None for them), so they share one empty entry per project.
+            _ => format!("{dep}\0none"),
+        };
+        let cell = self
+            .subtree_memo
+            .entry(cache_key)
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone();
+        cell.get_or_try_init(|| {
+            self.compute_dep_subtree(dep, input, external_deps_mapped)
+                .map(Arc::new)
+        })
+        .cloned()
+    }
+
+    fn compute_dep_subtree(
+        &self,
+        dep: &str,
+        input: &Input,
+        external_deps_mapped: &HashMap<String, Vec<String>>,
+    ) -> anyhow::Result<SubtreeResult> {
+        let Some(dep_inputs) =
+            get_inputs_for_dependency(&self.project_graph.nodes[dep], &self.nx_json, input)?
+        else {
+            return Ok(SubtreeResult {
+                ids: vec![],
+                needs_legacy: false,
+            });
+        };
+
+        // Deps-outputs resolution depends on the root task; a propagation shape
+        // other than the canonical single input is unexpected — both fall back.
+        let mut needs_legacy =
+            !dep_inputs.deps_outputs.is_empty() || dep_inputs.deps_inputs.len() != 1;
+        let pool = &self.instruction_pool;
+        let mut ids: Vec<u32> = self
+            .gather_self_inputs(dep, &dep_inputs.self_inputs)
+            .into_iter()
+            .map(|instruction| pool.intern(instruction))
+            .collect();
+
+        if let Some(child_input) = dep_inputs.deps_inputs.first() {
+            for child in &self.project_graph.dependencies[dep] {
+                if self.project_graph.nodes.contains_key(child) {
+                    let sub =
+                        self.memoized_dep_subtree(child, child_input, external_deps_mapped)?;
+                    needs_legacy |= sub.needs_legacy;
+                    ids.extend_from_slice(&sub.ids);
+                } else if let Some(external_deps) = external_deps_mapped.get(child) {
+                    ids.push(pool.intern(HashInstruction::External(child.to_string())));
+                    ids.extend(
+                        external_deps
+                            .iter()
+                            .map(|s| pool.intern(HashInstruction::External(s.to_string()))),
+                    );
+                }
+            }
+        }
+
+        ids.sort_unstable();
+        ids.dedup();
+
+        Ok(SubtreeResult { ids, needs_legacy })
+    }
+
+    /// Dependency instructions for one task as pool ids: memoized subtrees are
+    /// spliced as ids (no materialization); subtrees the memo cannot serve
+    /// (deps-outputs, cyclic graphs) go through the legacy per-task traversal
+    /// and are interned at this boundary.
+    fn gather_dependency_ids<'a>(
+        &'a self,
+        task: &Task,
+        inputs: &[Input],
+        task_graph: &TaskGraph,
+        project_deps: &'a [String],
+        external_deps_mapped: &'a HashMap<String, Vec<String>>,
+        visited: &mut VisitedTracker<'a>,
+    ) -> anyhow::Result<Vec<u32>> {
+        let pool = &self.instruction_pool;
+        let memo_enabled = self.dependency_memo_enabled();
+        let mut ids: Vec<u32> = Vec::new();
+
+        for input in inputs {
+            let scope = visited.scope_start();
+            for dep in project_deps {
+                if !visited.insert(dep.as_str()) {
+                    continue;
+                }
+                if self.project_graph.nodes.contains_key(dep) {
+                    if memo_enabled {
+                        let sub = self.memoized_dep_subtree(dep, input, external_deps_mapped)?;
+                        if !sub.needs_legacy {
+                            ids.extend_from_slice(&sub.ids);
+                            continue;
+                        }
+                    }
+                    let Some(dep_inputs) = get_inputs_for_dependency(
+                        &self.project_graph.nodes[dep],
+                        &self.nx_json,
+                        input,
+                    )?
+                    else {
+                        continue;
+                    };
+                    ids.extend(
+                        self.self_and_deps_inputs(
+                            dep,
+                            task,
+                            &dep_inputs,
+                            task_graph,
+                            external_deps_mapped,
+                            visited,
+                        )?
+                        .into_iter()
+                        .map(|instruction| pool.intern(instruction)),
+                    );
+                } else if let Some(external_deps) = external_deps_mapped.get(dep) {
+                    ids.push(pool.intern(HashInstruction::External(dep.to_string())));
+                    ids.extend(
+                        external_deps
+                            .iter()
+                            .map(|s| pool.intern(HashInstruction::External(s.to_string()))),
+                    );
+                }
+            }
+            if inputs.len() > 1 {
+                visited.rollback_to(scope);
+            }
+        }
+
+        Ok(ids)
     }
 
     // todo(jcammisuli): parallelize this more. This function takes the longest time to run
